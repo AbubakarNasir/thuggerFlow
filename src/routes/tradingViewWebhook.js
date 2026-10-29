@@ -238,11 +238,14 @@ router.post("/tradingview", async (req, res) => {
         ? Date.parse(body.bar_timestamp)
         : NaN;
 
+    const now = Date.now();
     const futureToleranceMs = 60_000;
+    const maxAgeMs = 24 * 60 * 60 * 1_000;
 
     if (
       !Number.isFinite(dailyBiasTimestamp) ||
-      dailyBiasTimestamp > Date.now() + futureToleranceMs
+      dailyBiasTimestamp > now + futureToleranceMs ||
+      dailyBiasTimestamp < now - maxAgeMs
     ) {
       invalidFields.push("bar_timestamp");
     }
