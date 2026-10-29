@@ -26,6 +26,15 @@ router.post("/tradingview", async (req, res) => {
 
   const { event_id, event_type, setup_id } = body;
 
+  const lifecycleEventTypes = new Set([
+    "potential",
+    "confirmed",
+    "cancelled",
+    "expired",
+  ]);
+
+  const isLifecycleEvent = lifecycleEventTypes.has(event_type);
+
   const invalidFields = [];
 
   if (typeof event_id !== "string" || !event_id.trim()) {
@@ -44,6 +53,61 @@ router.post("/tradingview", async (req, res) => {
     (typeof setup_id !== "string" || !setup_id.trim())
   ) {
     invalidFields.push("setup_id");
+  }
+
+  if (isLifecycleEvent) {
+    if (typeof setup_id !== "string" || !setup_id.trim()) {
+      invalidFields.push("setup_id");
+    }
+
+    if (body.instrument !== "US100") {
+      invalidFields.push("instrument");
+    }
+
+    if (body.timeframe !== "M15") {
+      invalidFields.push("timeframe");
+    }
+
+    if (
+      typeof body.bar_timestamp !== "string" ||
+      Number.isNaN(Date.parse(body.bar_timestamp))
+    ) {
+      invalidFields.push("bar_timestamp");
+    }
+
+    if (!["long", "short"].includes(body.direction)) {
+      invalidFields.push("direction");
+    }
+
+    if (
+      !Number.isInteger(body.confidence_score) ||
+      body.confidence_score < 0 ||
+      body.confidence_score > 100
+    ) {
+      invalidFields.push("confidence_score");
+    }
+
+    if (["potential", "confirmed"].includes(event_type)) {
+      if (
+        typeof body.entry !== "number" ||
+        !Number.isFinite(body.entry) ||
+        body.entry <= 0
+      ) {
+        invalidFields.push("entry");
+      }
+
+      if (
+        typeof body.stop_loss !== "number" ||
+        !Number.isFinite(body.stop_loss) ||
+        body.stop_loss <= 0
+      ) {
+        invalidFields.push("stop_loss");
+      }
+
+      if (!Array.isArray(body.targets)) {
+        invalidFields.push("targets");
+      }
+    }
   }
 
   if (invalidFields.length > 0) {
