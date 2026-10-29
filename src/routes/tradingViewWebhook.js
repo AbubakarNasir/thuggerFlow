@@ -104,7 +104,39 @@ router.post("/tradingview", async (req, res) => {
         invalidFields.push("stop_loss");
       }
 
-      if (!Array.isArray(body.targets)) {
+      if (
+        typeof body.entry === "number" &&
+        Number.isFinite(body.entry) &&
+        body.entry > 0 &&
+        typeof body.stop_loss === "number" &&
+        Number.isFinite(body.stop_loss) &&
+        body.stop_loss > 0 &&
+        ["long", "short"].includes(body.direction)
+      ) {
+        if (
+          body.direction === "long" &&
+          body.stop_loss >= body.entry
+        ) {
+          invalidFields.push("stop_loss");
+        }
+
+        if (
+          body.direction === "short" &&
+          body.stop_loss <= body.entry
+        ) {
+          invalidFields.push("stop_loss");
+        }
+      }
+
+      if (
+        !Array.isArray(body.targets) ||
+        !body.targets.every(
+          (target) =>
+            typeof target === "number" &&
+            Number.isFinite(target) &&
+            target > 0
+        )
+      ) {
         invalidFields.push("targets");
       }
     }
