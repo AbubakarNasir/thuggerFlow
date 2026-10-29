@@ -163,6 +163,27 @@ router.post("/tradingview", async (req, res) => {
           invalidFields.push("targets");
         }
       }
+
+      if (
+        typeof body.entry === "number" &&
+        Number.isFinite(body.entry) &&
+        body.entry > 0 &&
+        typeof body.stop_loss === "number" &&
+        Number.isFinite(body.stop_loss) &&
+        body.stop_loss > 0 &&
+        Array.isArray(body.targets) &&
+        body.targets.length > 0 &&
+        Number.isFinite(body.targets[0]) &&
+        ["long", "short"].includes(body.direction)
+      ) {
+        const risk = Math.abs(body.entry - body.stop_loss);
+        const reward = Math.abs(body.targets[0] - body.entry);
+        const riskRewardRatio = reward / risk;
+
+        if (risk === 0 || riskRewardRatio < 2) {
+          invalidFields.push("targets");
+        }
+      }
     }
   }
 
