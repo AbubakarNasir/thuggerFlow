@@ -139,6 +139,30 @@ router.post("/tradingview", async (req, res) => {
       ) {
         invalidFields.push("targets");
       }
+
+      if (
+        typeof body.entry === "number" &&
+        Number.isFinite(body.entry) &&
+        body.entry > 0 &&
+        Array.isArray(body.targets) &&
+        ["long", "short"].includes(body.direction)
+      ) {
+        const hasInvalidTarget = body.targets.some((target) => {
+          if (typeof target !== "number" || !Number.isFinite(target)) {
+            return false; // Existing validation handles invalid target types.
+          }
+
+          if (body.direction === "long") {
+            return target <= body.entry;
+          }
+
+          return target >= body.entry;
+        });
+
+        if (hasInvalidTarget) {
+          invalidFields.push("targets");
+        }
+      }
     }
   }
 
