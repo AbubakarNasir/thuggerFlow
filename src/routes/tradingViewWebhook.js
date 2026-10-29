@@ -48,6 +48,10 @@ router.post("/tradingview", async (req, res) => {
     invalidFields.push("event_type");
   }
 
+  if (body.schema_version !== "1.0") {
+    invalidFields.push("schema_version");
+  }
+
   if (
     setup_id !== undefined &&
     (typeof setup_id !== "string" || !setup_id.trim())
@@ -130,6 +134,7 @@ router.post("/tradingview", async (req, res) => {
 
       if (
         !Array.isArray(body.targets) ||
+        body.targets.length === 0 ||
         !body.targets.every(
           (target) =>
             typeof target === "number" &&
@@ -178,31 +183,99 @@ router.post("/tradingview", async (req, res) => {
       ) {
         const risk = Math.abs(body.entry - body.stop_loss);
         const reward = Math.abs(body.targets[0] - body.entry);
-        const riskRewardRatio = reward / risk;
 
-        if (risk === 0 || riskRewardRatio < 2) {
-          invalidFields.push("targets");
+        if (risk === 0) {
+          invalidFields.push("stop_loss");
+        } else {
+          const riskRewardRatio = reward / risk;
+
+          if (riskRewardRatio < 2) {
+            invalidFields.push("targets");
+          }
         }
       }
     }
   }
 
+  if (event_type === "heartbeat") {
+    if (body.instrument !== "US100") {
+      invalidFields.push("instrument");
+    }
+
+    if (body.timeframe !== "M15") {
+      invalidFields.push("timeframe");
+    }
+
+    const heartbeatTimestamp =
+      typeof body.bar_timestamp === "string"
+        ? Date.parse(body.bar_timestamp)
+        : NaN;
+
+    const now = Date.now();
+    const futureToleranceMs = 60_000;
+    const staleThresholdMs = 20 * 60_000;
+
+    if (
+      !Number.isFinite(heartbeatTimestamp) ||
+      heartbeatTimestamp > now + futureToleranceMs ||
+      heartbeatTimestamp < now - staleThresholdMs
+    ) {
+      invalidFields.push("bar_timestamp");
+    }
+  }
+
+  if (event_type === "daily_bias") {
+    if (body.instrument !== "US100") {
+      invalidFields.push("instrument");
+    }
+
+    if (body.timeframe !== "D1") {
+      invalidFields.push("timeframe");
+    }
+
+    const dailyBiasTimestamp =
+      typeof body.bar_timestamp === "string"
+        ? Date.parse(body.bar_timestamp)
+        : NaN;
+
+    const futureToleranceMs = 60_000;
+
+    if (
+      !Number.isFinite(dailyBiasTimestamp) ||
+      dailyBiasTimestamp > Date.now() + futureToleranceMs
+    ) {
+      invalidFields.push("bar_timestamp");
+    }
+
+    if (!["bullish", "bearish", "neutral"].includes(body.daily_bias)) {
+      invalidFields.push("daily_bias");
+    }
+  }
+
   if (invalidFields.length > 0) {
+    const uniqueInvalidFields = [...new Set(invalidFields)];
+
     try {
       await pool.query(
-        `INSERT INTO signal_events (
+        `INSERT INTO signal_event_audit (
           event_id,
-          event_type,
+          setup_id,
           correlation_id,
-          processing_status,
-          rejection_category
+          audit_type,
+          reason,
+          details
         )
-        VALUES ($1, $2, $3, 'rejected', $4)`,
+        VALUES ($1, $2, $3, $4, $5, $6)`,
         [
-          `rejected:${correlationId}`,
-          "invalid_event",
+          typeof event_id === "string" ? event_id : null,
+          typeof setup_id === "string" ? setup_id : null,
           correlationId,
-          `invalid_fields:${invalidFields.join(",")}`,
+          "validation_rejected",
+          "Event validation failed",
+          JSON.stringify({
+            invalidFields: uniqueInvalidFields,
+            eventType: event_type ?? null,
+          }),
         ]
       );
     } catch (error) {
@@ -216,7 +289,7 @@ router.post("/tradingview", async (req, res) => {
 
     return res.status(400).json({
       error: "Event validation failed",
-      invalidFields,
+      invalidFields: uniqueInvalidFields,
       correlationId,
     });
   }
