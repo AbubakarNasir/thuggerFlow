@@ -1,4 +1,3 @@
-
 import { Router } from "express";
 import { randomUUID } from "node:crypto";
 import { pool } from "../db.js";
@@ -20,6 +19,35 @@ const lifecycleEventTypes = new Set([
   "cancelled",
   "expired",
 ]);
+
+async function writeAudit(client, {
+  eventId,
+  setupId,
+  correlationId,
+  auditType,
+  reason,
+  details = {},
+}) {
+  await client.query(
+    `INSERT INTO signal_event_audit (
+      event_id,
+      setup_id,
+      correlation_id,
+      audit_type,
+      reason,
+      details
+    )
+    VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      eventId,
+      setupId,
+      correlationId,
+      auditType,
+      reason,
+      JSON.stringify(details),
+    ]
+  );
+}
 
 router.post("/tradingview", async (req, res) => {
   const correlationId = randomUUID();
@@ -305,6 +333,7 @@ router.post("/tradingview", async (req, res) => {
     await client.query("BEGIN");
     transactionStarted = true;
 
+    // Insert the event first so setups.last_event_id can reference it.
     const result = await client.query(
       `INSERT INTO signal_events (
         event_id,
@@ -343,6 +372,227 @@ router.post("/tradingview", async (req, res) => {
       });
     }
 
+    // Lifecycle events are processed atomically with their setup changes.
+    if (isLifecycleEvent) {
+      // Serialize events for the same setup, including first-time creation.
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+        [setup_id]
+      );
+
+      const setupResult = await client.query(
+        `SELECT *
+         FROM setups
+         WHERE setup_id = $1
+         FOR UPDATE`,
+        [setup_id]
+      );
+
+      const existingSetup = setupResult.rows[0] ?? null;
+
+      let processingOutcome = "ignored";
+
+      // A potential event creates a setup if it does not exist.
+      if (!existingSetup && event_type === "potential") {
+        await client.query(
+          `INSERT INTO setups (
+            setup_id,
+            instrument,
+            timeframe,
+            direction,
+            setup_state,
+            confidence_score,
+            entry_price,
+            stop_loss,
+            targets,
+            last_event_id,
+            last_source_timestamp
+          )
+          VALUES ($1, $2, $3, $4, 'potential', $5, $6, $7, $8::jsonb, $9, $10)`,
+          [
+            setup_id,
+            body.instrument,
+            body.timeframe,
+            body.direction,
+            body.confidence_score,
+            body.entry,
+            body.stop_loss,
+            JSON.stringify(body.targets),
+            event_id,
+            body.bar_timestamp,
+          ]
+        );
+
+        processingOutcome = "setup_created";
+      } else if (!existingSetup) {
+        // Confirmed, cancelled, or expired events cannot create a setup.
+        await writeAudit(client, {
+          eventId: event_id,
+          setupId: setup_id,
+          correlationId,
+          auditType: "unknown_setup_ignored",
+          reason: "Lifecycle event received for an unknown setup",
+          details: { eventType: event_type },
+        });
+
+        processingOutcome = "unknown_setup_ignored";
+      } else {
+        const incomingTimestamp = Date.parse(body.bar_timestamp);
+        const existingTimestamp = existingSetup.last_source_timestamp
+          ? new Date(existingSetup.last_source_timestamp).getTime()
+          : null;
+
+        // Older events must never overwrite newer setup data.
+        if (
+          existingTimestamp !== null &&
+          incomingTimestamp < existingTimestamp
+        ) {
+          await writeAudit(client, {
+            eventId: event_id,
+            setupId: setup_id,
+            correlationId,
+            auditType: "stale_event_ignored",
+            reason: "Older event cannot overwrite newer setup data",
+            details: {
+              incomingTimestamp: body.bar_timestamp,
+              existingTimestamp: existingSetup.last_source_timestamp,
+              existingState: existingSetup.setup_state,
+            },
+          });
+
+          processingOutcome = "stale_event_ignored";
+        } else if (
+          existingTimestamp !== null &&
+          incomingTimestamp === existingTimestamp
+        ) {
+          // Different event IDs at the same source timestamp are quarantined.
+          await writeAudit(client, {
+            eventId: event_id,
+            setupId: setup_id,
+            correlationId,
+            auditType: "event_timestamp_conflict",
+            reason: "Different events share the same source timestamp",
+            details: {
+              incomingTimestamp: body.bar_timestamp,
+              existingEventId: existingSetup.last_event_id,
+            },
+          });
+
+          processingOutcome = "event_timestamp_conflict";
+        } else if (
+          ["cancelled", "expired"].includes(existingSetup.setup_state)
+        ) {
+          // Terminal states cannot be reversed automatically.
+          await writeAudit(client, {
+            eventId: event_id,
+            setupId: setup_id,
+            correlationId,
+            auditType: "terminal_state_immutable",
+            reason: "Terminal setup state cannot be reversed automatically",
+            details: {
+              existingState: existingSetup.setup_state,
+              incomingEventType: event_type,
+            },
+          });
+
+          processingOutcome = "terminal_state_immutable";
+        } else if (
+          existingSetup.setup_state === "confirmed" &&
+          event_type === "potential"
+        ) {
+          // A potential event cannot downgrade a confirmed setup.
+          await writeAudit(client, {
+            eventId: event_id,
+            setupId: setup_id,
+            correlationId,
+            auditType: "confirmed_state_protected",
+            reason: "Potential event cannot downgrade a confirmed setup",
+            details: {
+              incomingTimestamp: body.bar_timestamp,
+            },
+          });
+
+          processingOutcome = "confirmed_state_protected";
+        } else {
+          let nextState = existingSetup.setup_state;
+
+          if (event_type === "confirmed") {
+            nextState = "confirmed";
+          } else if (event_type === "cancelled") {
+            nextState = "cancelled";
+          } else if (event_type === "expired") {
+            nextState = "expired";
+          }
+
+          const nextEntry =
+            body.entry === undefined ? null : body.entry;
+
+          const nextStopLoss =
+            body.stop_loss === undefined ? null : body.stop_loss;
+
+          const nextTargets =
+            body.targets === undefined
+              ? null
+              : JSON.stringify(body.targets);
+
+          const cancellationReason =
+            ["cancelled", "expired"].includes(nextState)
+              ? (typeof body.reason === "string" ? body.reason : null)
+              : null;
+
+          await client.query(
+            `UPDATE setups
+             SET
+               direction = $1,
+               setup_state = $2,
+               confidence_score = $3,
+               entry_price = COALESCE($4, entry_price),
+               stop_loss = COALESCE($5, stop_loss),
+               targets = COALESCE($6::jsonb, targets),
+               last_event_id = $7,
+               last_source_timestamp = $8,
+               cancellation_reason = $9,
+               updated_at = NOW()
+             WHERE setup_id = $10`,
+            [
+              body.direction,
+              nextState,
+              body.confidence_score,
+              nextEntry,
+              nextStopLoss,
+              nextTargets,
+              event_id,
+              body.bar_timestamp,
+              cancellationReason,
+              setup_id,
+            ]
+          );
+
+          processingOutcome = `setup_${nextState}`;
+        }
+      }
+
+      // Every examined lifecycle event is marked processed.
+      await client.query(
+        `UPDATE signal_events
+         SET processing_status = 'processed',
+             processed_at = NOW()
+         WHERE event_id = $1`,
+        [event_id]
+      );
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      return res.status(202).json({
+        status: "event_processed",
+        event_id,
+        processingOutcome,
+        correlationId,
+      });
+    }
+
+    // Heartbeat and daily-bias events are stored for separate processing.
     await client.query("COMMIT");
     transactionStarted = false;
 
