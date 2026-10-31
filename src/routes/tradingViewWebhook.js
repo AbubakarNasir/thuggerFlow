@@ -1,3 +1,4 @@
+
 import { Router } from "express";
 import { randomUUID } from "node:crypto";
 import { pool } from "../db.js";
@@ -13,6 +14,13 @@ const allowedEventTypes = new Set([
   "heartbeat",
 ]);
 
+const lifecycleEventTypes = new Set([
+  "potential",
+  "confirmed",
+  "cancelled",
+  "expired",
+]);
+
 router.post("/tradingview", async (req, res) => {
   const correlationId = randomUUID();
   const body = req.body;
@@ -25,14 +33,6 @@ router.post("/tradingview", async (req, res) => {
   }
 
   const { event_id, event_type, setup_id } = body;
-
-  const lifecycleEventTypes = new Set([
-    "potential",
-    "confirmed",
-    "cancelled",
-    "expired",
-  ]);
-
   const isLifecycleEvent = lifecycleEventTypes.has(event_type);
 
   const invalidFields = [];
@@ -153,8 +153,11 @@ router.post("/tradingview", async (req, res) => {
         ["long", "short"].includes(body.direction)
       ) {
         const hasInvalidTarget = body.targets.some((target) => {
-          if (typeof target !== "number" || !Number.isFinite(target)) {
-            return false; // Existing validation handles invalid target types.
+          if (
+            typeof target !== "number" ||
+            !Number.isFinite(target)
+          ) {
+            return false;
           }
 
           if (body.direction === "long") {
@@ -186,12 +189,8 @@ router.post("/tradingview", async (req, res) => {
 
         if (risk === 0) {
           invalidFields.push("stop_loss");
-        } else {
-          const riskRewardRatio = reward / risk;
-
-          if (riskRewardRatio < 2) {
-            invalidFields.push("targets");
-          }
+        } else if (reward / risk < 2) {
+          invalidFields.push("targets");
         }
       }
     }
@@ -297,8 +296,16 @@ router.post("/tradingview", async (req, res) => {
     });
   }
 
+  let client;
+  let transactionStarted = false;
+
   try {
-    const result = await pool.query(
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const result = await client.query(
       `INSERT INTO signal_events (
         event_id,
         event_type,
@@ -310,9 +317,7 @@ router.post("/tradingview", async (req, res) => {
         schema_version,
         payload
       )
-      VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9
-      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       ON CONFLICT (event_id) DO NOTHING
       RETURNING event_id`,
       [
@@ -329,11 +334,17 @@ router.post("/tradingview", async (req, res) => {
     );
 
     if (result.rowCount === 0) {
+      await client.query("COMMIT");
+      transactionStarted = false;
+
       return res.status(200).json({
         status: "duplicate_ignored",
         correlationId,
       });
     }
+
+    await client.query("COMMIT");
+    transactionStarted = false;
 
     return res.status(202).json({
       status: "event_received",
@@ -341,12 +352,27 @@ router.post("/tradingview", async (req, res) => {
       correlationId,
     });
   } catch (error) {
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error(
+          "Transaction rollback failed:",
+          rollbackError.message
+        );
+      }
+    }
+
     console.error("Webhook processing failed:", error.message);
 
     return res.status(500).json({
       error: "Could not accept event",
       correlationId,
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
