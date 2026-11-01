@@ -2,6 +2,7 @@ import express from "express";
 import "dotenv/config";
 import tradingViewWebhookRouter from "./routes/tradingViewWebhook.js";
 import { pool } from "./db.js";
+import { startNotificationWorker } from "./workers/notificationWorker.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,10 +11,10 @@ app.use(express.json({ limit: "32kb" }));
 app.use("/api/webhooks", tradingViewWebhookRouter);
 
 app.get("/health", (req, res) => {
-    res.status(200).json({ 
+    res.status(200).json({
         status: "ok",
         app: "ThuggerFlow",
-        mode: "development", 
+        mode: "development",
     });
 });
 
@@ -57,6 +58,56 @@ app.use((err, req, res, next) => {
     });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`ThuggerFlow server is running on port ${PORT}`);
+
+    startWorker();
 });
+
+let stopWorker = null;
+let shuttingDown = false;
+
+function startWorker() {
+    try {
+        stopWorker = startNotificationWorker();
+    } catch (error) {
+        console.error(
+            "Could not start notification worker:",
+            error.message
+        );
+    }
+}
+
+async function shutdown(signal) {
+    if (shuttingDown) return;
+
+    shuttingDown = true;
+    console.log(`${signal} received. Shutting down gracefully...`);
+
+    try {
+        // Stop accepting new HTTP connections.
+        await new Promise((resolve, reject) => {
+            server.close((error) => {
+                if (error) reject(error);
+                else resolve();
+            });
+        });
+
+        // Finish the worker's current batch.
+        if (stopWorker) {
+            await stopWorker();
+        }
+
+        // Close PostgreSQL connections last.
+        await pool.end();
+
+        console.log("ThuggerFlow shut down successfully.");
+        process.exit(0);
+    } catch (error) {
+        console.error("Shutdown error:", error.message);
+        process.exit(1);
+    }
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
