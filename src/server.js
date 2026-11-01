@@ -1,4 +1,5 @@
 import express from "express";
+import helmet from "helmet";
 import "dotenv/config";
 
 import tradingViewWebhookRouter from "./routes/tradingViewWebhook.js";
@@ -9,6 +10,19 @@ import { pool } from "./db.js";
 import { startNotificationWorker } from "./workers/notificationWorker.js";
 
 const app = express();
+
+app.use(
+    helmet({
+        hsts:
+            process.env.NODE_ENV === "production"
+                ? {
+                      maxAge: 31536000,
+                      includeSubDomains: true,
+                      preload: false,
+                  }
+                : false,
+    })
+);
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "127.0.0.1";
