@@ -1,5 +1,6 @@
+
 import { Router } from "express";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { pool } from "../db.js";
 
 const router = Router();
@@ -226,12 +227,55 @@ router.post("/tradingview", async (req, res) => {
   const correlationId = randomUUID();
   const body = req.body;
 
+  // --------------------------------------------------
+  // 1. WEBHOOK AUTHENTICATION
+  // --------------------------------------------------
+
+  const expectedSecret = process.env.TRADINGVIEW_WEBHOOK_SECRET;
+
+  if (!expectedSecret) {
+    console.error("TradingView webhook secret is not configured.");
+
+    return res.status(503).json({
+      error: "Webhook authentication is unavailable",
+      correlationId,
+    });
+  }
+
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return res.status(400).json({
       error: "Invalid JSON event",
       correlationId,
     });
   }
+
+  const suppliedSecret = body.webhook_secret;
+
+  const expectedBuffer = Buffer.from(expectedSecret, "utf8");
+
+  const suppliedBuffer =
+    typeof suppliedSecret === "string"
+      ? Buffer.from(suppliedSecret, "utf8")
+      : Buffer.alloc(0);
+
+  const authenticated =
+    expectedBuffer.length === suppliedBuffer.length &&
+    timingSafeEqual(expectedBuffer, suppliedBuffer);
+
+  if (!authenticated) {
+    return res.status(401).json({
+      error: "Unauthorized webhook request",
+      correlationId,
+    });
+  }
+
+  // Remove the secret before storing the event payload.
+  const eventPayload = { ...body };
+  delete eventPayload.webhook_secret;
+
+  // --------------------------------------------------
+  // 2. EVENT VALIDATION
+  // --------------------------------------------------
 
   const { event_id, event_type, setup_id } = body;
   const isLifecycleEvent = lifecycleEventTypes.has(event_type);
@@ -469,6 +513,10 @@ router.post("/tradingview", async (req, res) => {
     });
   }
 
+  // --------------------------------------------------
+  // 3. DATABASE TRANSACTION
+  // --------------------------------------------------
+
   let client;
   let transactionStarted = false;
 
@@ -502,7 +550,7 @@ router.post("/tradingview", async (req, res) => {
         body.bar_timestamp ?? null,
         correlationId,
         body.schema_version ?? null,
-        body,
+        eventPayload,
       ]
     );
 
@@ -516,8 +564,11 @@ router.post("/tradingview", async (req, res) => {
       });
     }
 
+    // --------------------------------------------------
+    // 4. SETUP LIFECYCLE PROCESSING
+    // --------------------------------------------------
+
     if (isLifecycleEvent) {
-      // Serialize all lifecycle events belonging to this setup.
       await client.query(
         `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
         [setup_id]
@@ -577,7 +628,6 @@ router.post("/tradingview", async (req, res) => {
 
         processingOutcome = "unknown_setup_ignored";
       } else {
-        // Compare timestamps inside PostgreSQL to preserve microseconds.
         const timestampResult = await client.query(
           `SELECT CASE
              WHEN $1::timestamptz < $2::timestamptz THEN -1

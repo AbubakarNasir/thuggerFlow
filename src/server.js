@@ -3,17 +3,41 @@ import "dotenv/config";
 
 import tradingViewWebhookRouter from "./routes/tradingViewWebhook.js";
 import telegramWebhookRouter from "./routes/telegramWebhook.js";
+import tradingViewRateLimiter from "./middleware/tradingViewRateLimiter.js";
 
 import { pool } from "./db.js";
 import { startNotificationWorker } from "./workers/notificationWorker.js";
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || "127.0.0.1";
+
+// --------------------------------------------------
+// 1. TRADINGVIEW RATE LIMITER
+// --------------------------------------------------
+
+app.use(
+    "/api/webhooks/tradingview",
+    tradingViewRateLimiter
+);
+
+// --------------------------------------------------
+// 2. REQUEST PARSING
+// --------------------------------------------------
 
 app.use(express.json({ limit: "32kb" }));
 
+// --------------------------------------------------
+// 3. API ROUTES
+// --------------------------------------------------
+
 app.use("/api/webhooks", tradingViewWebhookRouter);
 app.use("/api/telegram", telegramWebhookRouter);
+
+// --------------------------------------------------
+// 4. HEALTH ENDPOINTS
+// --------------------------------------------------
 
 app.get("/health", (req, res) => {
     res.status(200).json({
@@ -43,6 +67,10 @@ app.get("/health/db", async (req, res) => {
     }
 });
 
+// --------------------------------------------------
+// 5. GLOBAL ERROR HANDLER
+// --------------------------------------------------
+
 app.use((err, req, res, next) => {
     if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
         return res.status(400).json({
@@ -63,6 +91,10 @@ app.use((err, req, res, next) => {
     });
 });
 
+// --------------------------------------------------
+// 6. NOTIFICATION WORKER
+// --------------------------------------------------
+
 let stopWorker = null;
 let shuttingDown = false;
 
@@ -77,10 +109,18 @@ function startWorker() {
     }
 }
 
-const server = app.listen(PORT, () => {
-    console.log(`ThuggerFlow server is running on port ${PORT}`);
+// --------------------------------------------------
+// 7. SERVER START
+// --------------------------------------------------
+
+const server = app.listen(PORT, HOST, () => {
+    console.log(`ThuggerFlow server is running at http://${HOST}:${PORT}`);
     startWorker();
 });
+
+// --------------------------------------------------
+// 8. GRACEFUL SHUTDOWN
+// --------------------------------------------------
 
 async function shutdown(signal) {
     if (shuttingDown) return;
