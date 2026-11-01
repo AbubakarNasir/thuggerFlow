@@ -20,14 +20,78 @@ const lifecycleEventTypes = new Set([
   "expired",
 ]);
 
-async function writeAudit(client, {
-  eventId,
-  setupId,
-  correlationId,
-  auditType,
-  reason,
-  details = {},
-}) {
+const FUTURE_TOLERANCE_MS = 60_000;
+const HEARTBEAT_STALE_MS = 20 * 60_000;
+const DAILY_BIAS_MAX_AGE_MS = 24 * 60 * 60_000;
+
+// Require a complete ISO-8601 timestamp with an explicit timezone.
+// Fractional seconds are limited to PostgreSQL's microsecond precision.
+function isValidIsoTimestamp(value) {
+  if (typeof value !== "string") return false;
+
+  const match = value.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|([+-])(\d{2}):(\d{2}))$/
+  );
+
+  if (!match) return false;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+
+  if (year < 1 || month < 1 || month > 12) return false;
+  if (hour > 23 || minute > 59 || second > 59) return false;
+
+  const leapYear =
+    year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ];
+
+  if (day < 1 || day > daysInMonth[month - 1]) return false;
+
+  if (match[8] !== "Z") {
+    const offsetHours = Number(match[10]);
+    const offsetMinutes = Number(match[11]);
+
+    if (offsetHours > 14 || offsetMinutes > 59) return false;
+    if (offsetHours === 14 && offsetMinutes !== 0) return false;
+  }
+
+  return Number.isFinite(Date.parse(value));
+}
+
+function timestampMilliseconds(value) {
+  if (!isValidIsoTimestamp(value)) return NaN;
+  return Date.parse(value);
+}
+
+async function writeAudit(
+  client,
+  {
+    eventId,
+    setupId,
+    correlationId,
+    auditType,
+    reason,
+    details = {},
+  }
+) {
   await client.query(
     `INSERT INTO signal_event_audit (
       event_id,
@@ -49,6 +113,67 @@ async function writeAudit(client, {
   );
 }
 
+function validateTargets(body, invalidFields) {
+  if (
+    !Array.isArray(body.targets) ||
+    body.targets.length === 0 ||
+    body.targets.length > 3 ||
+    !body.targets.every(
+      (target) =>
+        typeof target === "number" &&
+        Number.isFinite(target) &&
+        target > 0
+    )
+  ) {
+    invalidFields.push("targets");
+    return;
+  }
+
+  if (!["long", "short"].includes(body.direction)) return;
+
+  // Targets must be ordered from nearest to furthest.
+  for (let index = 0; index < body.targets.length; index += 1) {
+    const target = body.targets[index];
+
+    if (body.direction === "long" && target <= body.entry) {
+      invalidFields.push("targets");
+      return;
+    }
+
+    if (body.direction === "short" && target >= body.entry) {
+      invalidFields.push("targets");
+      return;
+    }
+
+    if (index > 0) {
+      const previousTarget = body.targets[index - 1];
+
+      if (
+        body.direction === "long" &&
+        target <= previousTarget
+      ) {
+        invalidFields.push("targets");
+        return;
+      }
+
+      if (
+        body.direction === "short" &&
+        target >= previousTarget
+      ) {
+        invalidFields.push("targets");
+        return;
+      }
+    }
+  }
+
+  const risk = Math.abs(body.entry - body.stop_loss);
+  const reward = Math.abs(body.targets[0] - body.entry);
+
+  if (risk <= 0 || reward / risk < 2) {
+    invalidFields.push("targets");
+  }
+}
+
 router.post("/tradingview", async (req, res) => {
   const correlationId = randomUUID();
   const body = req.body;
@@ -62,8 +187,8 @@ router.post("/tradingview", async (req, res) => {
 
   const { event_id, event_type, setup_id } = body;
   const isLifecycleEvent = lifecycleEventTypes.has(event_type);
-
   const invalidFields = [];
+  const now = Date.now();
 
   if (typeof event_id !== "string" || !event_id.trim()) {
     invalidFields.push("event_id");
@@ -100,9 +225,13 @@ router.post("/tradingview", async (req, res) => {
       invalidFields.push("timeframe");
     }
 
+    const lifecycleTimestamp = timestampMilliseconds(
+      body.bar_timestamp
+    );
+
     if (
-      typeof body.bar_timestamp !== "string" ||
-      Number.isNaN(Date.parse(body.bar_timestamp))
+      !Number.isFinite(lifecycleTimestamp) ||
+      lifecycleTimestamp > now + FUTURE_TOLERANCE_MS
     ) {
       invalidFields.push("bar_timestamp");
     }
@@ -161,46 +290,6 @@ router.post("/tradingview", async (req, res) => {
       }
 
       if (
-        !Array.isArray(body.targets) ||
-        body.targets.length === 0 ||
-        !body.targets.every(
-          (target) =>
-            typeof target === "number" &&
-            Number.isFinite(target) &&
-            target > 0
-        )
-      ) {
-        invalidFields.push("targets");
-      }
-
-      if (
-        typeof body.entry === "number" &&
-        Number.isFinite(body.entry) &&
-        body.entry > 0 &&
-        Array.isArray(body.targets) &&
-        ["long", "short"].includes(body.direction)
-      ) {
-        const hasInvalidTarget = body.targets.some((target) => {
-          if (
-            typeof target !== "number" ||
-            !Number.isFinite(target)
-          ) {
-            return false;
-          }
-
-          if (body.direction === "long") {
-            return target <= body.entry;
-          }
-
-          return target >= body.entry;
-        });
-
-        if (hasInvalidTarget) {
-          invalidFields.push("targets");
-        }
-      }
-
-      if (
         typeof body.entry === "number" &&
         Number.isFinite(body.entry) &&
         body.entry > 0 &&
@@ -212,14 +301,28 @@ router.post("/tradingview", async (req, res) => {
         Number.isFinite(body.targets[0]) &&
         ["long", "short"].includes(body.direction)
       ) {
-        const risk = Math.abs(body.entry - body.stop_loss);
-        const reward = Math.abs(body.targets[0] - body.entry);
+        validateTargets(body, invalidFields);
+      } else if (
+        !Array.isArray(body.targets) ||
+        body.targets.length === 0 ||
+        body.targets.length > 3 ||
+        !body.targets.every(
+          (target) =>
+            typeof target === "number" &&
+            Number.isFinite(target) &&
+            target > 0
+        )
+      ) {
+        invalidFields.push("targets");
+      }
+    }
 
-        if (risk === 0) {
-          invalidFields.push("stop_loss");
-        } else if (reward / risk < 2) {
-          invalidFields.push("targets");
-        }
+    if (["cancelled", "expired"].includes(event_type)) {
+      if (
+        typeof body.reason !== "string" ||
+        !body.reason.trim()
+      ) {
+        invalidFields.push("reason");
       }
     }
   }
@@ -233,19 +336,14 @@ router.post("/tradingview", async (req, res) => {
       invalidFields.push("timeframe");
     }
 
-    const heartbeatTimestamp =
-      typeof body.bar_timestamp === "string"
-        ? Date.parse(body.bar_timestamp)
-        : NaN;
-
-    const now = Date.now();
-    const futureToleranceMs = 60_000;
-    const staleThresholdMs = 20 * 60_000;
+    const heartbeatTimestamp = timestampMilliseconds(
+      body.bar_timestamp
+    );
 
     if (
       !Number.isFinite(heartbeatTimestamp) ||
-      heartbeatTimestamp > now + futureToleranceMs ||
-      heartbeatTimestamp < now - staleThresholdMs
+      heartbeatTimestamp > now + FUTURE_TOLERANCE_MS ||
+      heartbeatTimestamp < now - HEARTBEAT_STALE_MS
     ) {
       invalidFields.push("bar_timestamp");
     }
@@ -260,19 +358,14 @@ router.post("/tradingview", async (req, res) => {
       invalidFields.push("timeframe");
     }
 
-    const dailyBiasTimestamp =
-      typeof body.bar_timestamp === "string"
-        ? Date.parse(body.bar_timestamp)
-        : NaN;
-
-    const now = Date.now();
-    const futureToleranceMs = 60_000;
-    const maxAgeMs = 24 * 60 * 60 * 1_000;
+    const dailyBiasTimestamp = timestampMilliseconds(
+      body.bar_timestamp
+    );
 
     if (
       !Number.isFinite(dailyBiasTimestamp) ||
-      dailyBiasTimestamp > now + futureToleranceMs ||
-      dailyBiasTimestamp < now - maxAgeMs
+      dailyBiasTimestamp > now + FUTURE_TOLERANCE_MS ||
+      dailyBiasTimestamp < now - DAILY_BIAS_MAX_AGE_MS
     ) {
       invalidFields.push("bar_timestamp");
     }
@@ -333,7 +426,6 @@ router.post("/tradingview", async (req, res) => {
     await client.query("BEGIN");
     transactionStarted = true;
 
-    // Insert the event first so setups.last_event_id can reference it.
     const result = await client.query(
       `INSERT INTO signal_events (
         event_id,
@@ -372,9 +464,8 @@ router.post("/tradingview", async (req, res) => {
       });
     }
 
-    // Lifecycle events are processed atomically with their setup changes.
     if (isLifecycleEvent) {
-      // Serialize events for the same setup, including first-time creation.
+      // Serialize all lifecycle events belonging to this setup.
       await client.query(
         `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
         [setup_id]
@@ -389,10 +480,8 @@ router.post("/tradingview", async (req, res) => {
       );
 
       const existingSetup = setupResult.rows[0] ?? null;
-
       let processingOutcome = "ignored";
 
-      // A potential event creates a setup if it does not exist.
       if (!existingSetup && event_type === "potential") {
         await client.query(
           `INSERT INTO setups (
@@ -425,7 +514,6 @@ router.post("/tradingview", async (req, res) => {
 
         processingOutcome = "setup_created";
       } else if (!existingSetup) {
-        // Confirmed, cancelled, or expired events cannot create a setup.
         await writeAudit(client, {
           eventId: event_id,
           setupId: setup_id,
@@ -437,16 +525,21 @@ router.post("/tradingview", async (req, res) => {
 
         processingOutcome = "unknown_setup_ignored";
       } else {
-        const incomingTimestamp = Date.parse(body.bar_timestamp);
-        const existingTimestamp = existingSetup.last_source_timestamp
-          ? new Date(existingSetup.last_source_timestamp).getTime()
-          : null;
+        // Compare timestamps inside PostgreSQL. This preserves the
+        // database's microsecond precision; JavaScript Date does not.
+        const timestampResult = await client.query(
+          `SELECT CASE
+             WHEN $1::timestamptz < $2::timestamptz THEN -1
+             WHEN $1::timestamptz = $2::timestamptz THEN 0
+             ELSE 1
+           END AS comparison`,
+          [body.bar_timestamp, existingSetup.last_source_timestamp]
+        );
 
-        // Older events must never overwrite newer setup data.
-        if (
-          existingTimestamp !== null &&
-          incomingTimestamp < existingTimestamp
-        ) {
+        const timestampComparison =
+          Number(timestampResult.rows[0].comparison);
+
+        if (timestampComparison < 0) {
           await writeAudit(client, {
             eventId: event_id,
             setupId: setup_id,
@@ -461,11 +554,7 @@ router.post("/tradingview", async (req, res) => {
           });
 
           processingOutcome = "stale_event_ignored";
-        } else if (
-          existingTimestamp !== null &&
-          incomingTimestamp === existingTimestamp
-        ) {
-          // Different event IDs at the same source timestamp are quarantined.
+        } else if (timestampComparison === 0) {
           await writeAudit(client, {
             eventId: event_id,
             setupId: setup_id,
@@ -482,7 +571,6 @@ router.post("/tradingview", async (req, res) => {
         } else if (
           ["cancelled", "expired"].includes(existingSetup.setup_state)
         ) {
-          // Terminal states cannot be reversed automatically.
           await writeAudit(client, {
             eventId: event_id,
             setupId: setup_id,
@@ -500,7 +588,6 @@ router.post("/tradingview", async (req, res) => {
           existingSetup.setup_state === "confirmed" &&
           event_type === "potential"
         ) {
-          // A potential event cannot downgrade a confirmed setup.
           await writeAudit(client, {
             eventId: event_id,
             setupId: setup_id,
@@ -537,7 +624,7 @@ router.post("/tradingview", async (req, res) => {
 
           const cancellationReason =
             ["cancelled", "expired"].includes(nextState)
-              ? (typeof body.reason === "string" ? body.reason : null)
+              ? body.reason.trim()
               : null;
 
           await client.query(
@@ -572,7 +659,6 @@ router.post("/tradingview", async (req, res) => {
         }
       }
 
-      // Every examined lifecycle event is marked processed.
       await client.query(
         `UPDATE signal_events
          SET processing_status = 'processed',
