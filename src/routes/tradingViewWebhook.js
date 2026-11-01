@@ -113,6 +113,54 @@ async function writeAudit(
   );
 }
 
+// Build subscriber notifications only for meaningful setup outcomes.
+function buildNotificationText(body, processingOutcome) {
+  const labels = {
+    setup_created: "New potential setup",
+    setup_potential: "Potential setup updated",
+    setup_confirmed: "Setup confirmed",
+    setup_cancelled: "Setup cancelled",
+    setup_expired: "Setup expired",
+  };
+
+  const label = labels[processingOutcome];
+
+  if (!label) return null;
+
+  const lines = [
+    `THUGGERFLOW | ${label}`,
+    `Instrument: ${body.instrument}`,
+    `Direction: ${body.direction.toUpperCase()}`,
+    `Setup ID: ${body.setup_id}`,
+  ];
+
+  if (
+    [
+      "setup_created",
+      "setup_potential",
+      "setup_confirmed",
+    ].includes(processingOutcome)
+  ) {
+    lines.push(
+      `Timeframe: ${body.timeframe}`,
+      `Entry reference: ${body.entry}`,
+      `Stop loss: ${body.stop_loss}`,
+      `Targets: ${body.targets.join(", ")}`,
+      `Confidence evidence score: ${body.confidence_score}/100 (not a probability)`
+    );
+  }
+
+  if (
+    ["setup_cancelled", "setup_expired"].includes(
+      processingOutcome
+    )
+  ) {
+    lines.push(`Reason: ${body.reason.slice(0, 500)}`);
+  }
+
+  return lines.join("\n");
+}
+
 function validateTargets(body, invalidFields) {
   if (
     !Array.isArray(body.targets) ||
@@ -370,7 +418,11 @@ router.post("/tradingview", async (req, res) => {
       invalidFields.push("bar_timestamp");
     }
 
-    if (!["bullish", "bearish", "neutral"].includes(body.daily_bias)) {
+    if (
+      !["bullish", "bearish", "neutral"].includes(
+        body.daily_bias
+      )
+    ) {
       invalidFields.push("daily_bias");
     }
   }
@@ -525,8 +577,7 @@ router.post("/tradingview", async (req, res) => {
 
         processingOutcome = "unknown_setup_ignored";
       } else {
-        // Compare timestamps inside PostgreSQL. This preserves the
-        // database's microsecond precision; JavaScript Date does not.
+        // Compare timestamps inside PostgreSQL to preserve microseconds.
         const timestampResult = await client.query(
           `SELECT CASE
              WHEN $1::timestamptz < $2::timestamptz THEN -1
@@ -536,8 +587,9 @@ router.post("/tradingview", async (req, res) => {
           [body.bar_timestamp, existingSetup.last_source_timestamp]
         );
 
-        const timestampComparison =
-          Number(timestampResult.rows[0].comparison);
+        const timestampComparison = Number(
+          timestampResult.rows[0].comparison
+        );
 
         if (timestampComparison < 0) {
           await writeAudit(client, {
@@ -569,14 +621,17 @@ router.post("/tradingview", async (req, res) => {
 
           processingOutcome = "event_timestamp_conflict";
         } else if (
-          ["cancelled", "expired"].includes(existingSetup.setup_state)
+          ["cancelled", "expired"].includes(
+            existingSetup.setup_state
+          )
         ) {
           await writeAudit(client, {
             eventId: event_id,
             setupId: setup_id,
             correlationId,
             auditType: "terminal_state_immutable",
-            reason: "Terminal setup state cannot be reversed automatically",
+            reason:
+              "Terminal setup state cannot be reversed automatically",
             details: {
               existingState: existingSetup.setup_state,
               incomingEventType: event_type,
@@ -593,7 +648,8 @@ router.post("/tradingview", async (req, res) => {
             setupId: setup_id,
             correlationId,
             auditType: "confirmed_state_protected",
-            reason: "Potential event cannot downgrade a confirmed setup",
+            reason:
+              "Potential event cannot downgrade a confirmed setup",
             details: {
               incomingTimestamp: body.bar_timestamp,
             },
@@ -667,6 +723,38 @@ router.post("/tradingview", async (req, res) => {
         [event_id]
       );
 
+      // Queue notifications in the same transaction as the setup change.
+      let notificationsQueued = 0;
+
+      const notificationText = buildNotificationText(
+        body,
+        processingOutcome
+      );
+
+      if (notificationText) {
+        const notificationResult = await client.query(
+          `INSERT INTO notification_outbox (
+             event_id,
+             telegram_chat_id,
+             payload
+           )
+           SELECT
+             $1,
+             users.chat_id,
+             jsonb_build_object('text', $2::text)
+           FROM subscriptions AS subs
+           INNER JOIN telegram_users AS users
+             ON users.telegram_user_id = subs.telegram_user_id
+           WHERE subs.status = 'active'
+           ON CONFLICT (event_id, telegram_chat_id)
+           DO NOTHING
+           RETURNING id`,
+          [event_id, notificationText]
+        );
+
+        notificationsQueued = notificationResult.rowCount;
+      }
+
       await client.query("COMMIT");
       transactionStarted = false;
 
@@ -674,6 +762,7 @@ router.post("/tradingview", async (req, res) => {
         status: "event_processed",
         event_id,
         processingOutcome,
+        notificationsQueued,
         correlationId,
       });
     }
