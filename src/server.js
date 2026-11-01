@@ -1,6 +1,9 @@
 import express from "express";
 import "dotenv/config";
+
 import tradingViewWebhookRouter from "./routes/tradingViewWebhook.js";
+import telegramWebhookRouter from "./routes/telegramWebhook.js";
+
 import { pool } from "./db.js";
 import { startNotificationWorker } from "./workers/notificationWorker.js";
 
@@ -8,7 +11,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: "32kb" }));
+
 app.use("/api/webhooks", tradingViewWebhookRouter);
+app.use("/api/telegram", telegramWebhookRouter);
 
 app.get("/health", (req, res) => {
     res.status(200).json({
@@ -58,12 +63,6 @@ app.use((err, req, res, next) => {
     });
 });
 
-const server = app.listen(PORT, () => {
-    console.log(`ThuggerFlow server is running on port ${PORT}`);
-
-    startWorker();
-});
-
 let stopWorker = null;
 let shuttingDown = false;
 
@@ -78,6 +77,11 @@ function startWorker() {
     }
 }
 
+const server = app.listen(PORT, () => {
+    console.log(`ThuggerFlow server is running on port ${PORT}`);
+    startWorker();
+});
+
 async function shutdown(signal) {
     if (shuttingDown) return;
 
@@ -85,7 +89,6 @@ async function shutdown(signal) {
     console.log(`${signal} received. Shutting down gracefully...`);
 
     try {
-        // Stop accepting new HTTP connections.
         await new Promise((resolve, reject) => {
             server.close((error) => {
                 if (error) reject(error);
@@ -93,12 +96,10 @@ async function shutdown(signal) {
             });
         });
 
-        // Finish the worker's current batch.
         if (stopWorker) {
             await stopWorker();
         }
 
-        // Close PostgreSQL connections last.
         await pool.end();
 
         console.log("ThuggerFlow shut down successfully.");
